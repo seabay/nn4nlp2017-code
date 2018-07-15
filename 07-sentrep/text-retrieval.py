@@ -53,20 +53,31 @@ LOOKUP_SRC = model.add_lookup_parameters((nwords_src, EMBED_SIZE))
 LOOKUP_TRG = model.add_lookup_parameters((nwords_trg, EMBED_SIZE))
 
 # Word-level BiLSTMs
-LSTM_SRC = dy.BiRNNBuilder(1, EMBED_SIZE, HIDDEN_SIZE, model, dy.LSTMBuilder)
-LSTM_TRG = dy.BiRNNBuilder(1, EMBED_SIZE, HIDDEN_SIZE, model, dy.LSTMBuilder)
+LSTM_SRC_FWD = dy.LSTMBuilder(1, EMBED_SIZE, HIDDEN_SIZE/2, model)
+LSTM_SRC_BWD = dy.LSTMBuilder(1, EMBED_SIZE, HIDDEN_SIZE/2, model)
+LSTM_TRG_FWD = dy.LSTMBuilder(1, EMBED_SIZE, HIDDEN_SIZE/2, model)
+LSTM_TRG_BWD = dy.LSTMBuilder(1, EMBED_SIZE, HIDDEN_SIZE/2, model)
+
+def encode_sents(look, fwd, bwd, sents):
+    embs = [[look[x] for x in sent] for sent in sents]
+    return [dy.concatenate([fwd.transduce(x)[-1], bwd.transduce(x)[-1]]) for x in embs]
 
 # Calculate loss for one mini-batch
 def calc_loss(sents):
     dy.renew_cg()
 
-    # Transduce all batch elements with an LSTM
-    sent_reps = [(LSTM_SRC.transduce([LOOKUP_SRC[x] for x in src])[-1],
-                  LSTM_TRG.transduce([LOOKUP_TRG[y] for y in trg])[-1]) for src, trg in sents]
+    src_fwd = LSTM_SRC_FWD.initial_state()
+    src_bwd = LSTM_SRC_BWD.initial_state()
+    trg_fwd = LSTM_TRG_FWD.initial_state()
+    trg_bwd = LSTM_TRG_BWD.initial_state()
+
+    # Encoding
+    src_reps = encode_sents(LOOKUP_SRC, src_fwd, src_bwd, [src for src, trg in sents])
+    trg_reps = encode_sents(LOOKUP_TRG, trg_fwd, trg_bwd, [trg for src, trg in sents])
 
     # Concatenate the sentence representations to a single matrix
-    mtx_src = dy.concatenate_cols([src for src, trg in sent_reps])
-    mtx_trg = dy.concatenate_cols([trg for src, trg in sent_reps])
+    mtx_src = dy.concatenate_cols(src_reps)
+    mtx_trg = dy.concatenate_cols(trg_reps)
 
     # Do matrix multiplication to get a matrix of dot product similarity scores
     sim_mtx = dy.transpose(mtx_src) * mtx_trg
@@ -82,17 +93,20 @@ def index_corpus(sents):
     # To take advantage of auto-batching, do several at a time
     for sid in range(0, len(sents), BATCH_SIZE):
         dy.renew_cg()
+
+        src_fwd = LSTM_SRC_FWD.initial_state()
+        src_bwd = LSTM_SRC_BWD.initial_state()
+        trg_fwd = LSTM_TRG_FWD.initial_state()
+        trg_bwd = LSTM_TRG_BWD.initial_state()
         
         # Set up the computation graph
-        exprs = []
-        for src, trg in sents[sid:min(sid+BATCH_SIZE,len(sents))]:
-            exprs.append((LSTM_SRC.transduce([LOOKUP_SRC[x] for x in src])[-1],
-                          LSTM_TRG.transduce([LOOKUP_TRG[y] for y in trg])[-1]))
+        src_exprs = encode_sents(LOOKUP_SRC, src_fwd, src_bwd, [src for src, trg in sents[sid:min(sid+BATCH_SIZE,len(sents))]])
+        trg_exprs = encode_sents(LOOKUP_TRG, trg_fwd, trg_bwd, [trg for src, trg in sents[sid:min(sid+BATCH_SIZE,len(sents))]])
 
         # Perform the forward pass to calculate everything at once
-        exprs[-1][1].forward()
+        trg_exprs[-1][1].forward()
 
-        for src_expr, trg_expr in exprs:
+        for src_expr, trg_expr in zip(src_exprs, trg_exprs):
             yield (src_expr.npvalue(), trg_expr.npvalue())
 
 # Perform retrieval, and return both scores and ranked order of candidates
